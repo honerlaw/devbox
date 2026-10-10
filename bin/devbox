@@ -295,7 +295,7 @@ use_devbox_context() {
   if [ -n "$current" ] && [ "$current" != "$DEVBOX_NAME" ]; then
     printf '%s\n' "$current" >"$PREV_CONTEXT_FILE"
   fi
-  docker context use "$DEVBOX_NAME" >/dev/null
+  docker context use "$DEVBOX_NAME" >/dev/null 2>&1
   info "docker now targets the devbox (docker context: $DEVBOX_NAME)"
   if [ -n "${DOCKER_HOST:-}" ] || [ -n "${DOCKER_CONTEXT:-}" ]; then
     warn "DOCKER_HOST/DOCKER_CONTEXT is set in this shell and overrides the active context"
@@ -308,7 +308,7 @@ restore_previous_context() {
   local prev="default"
   [ -f "$PREV_CONTEXT_FILE" ] && prev="$(cat "$PREV_CONTEXT_FILE")"
   docker context inspect "$prev" >/dev/null 2>&1 || prev="default"
-  docker context use "$prev" >/dev/null
+  docker context use "$prev" >/dev/null 2>&1
   info "docker context switched back to '$prev'"
 }
 
@@ -322,7 +322,8 @@ tunnel_start() {
   rm -f "$TUNNEL_SOCK"
   local args="" p holder busy=0
   for p in $DEVBOX_FORWARD_PORTS; do
-    holder="$(lsof -nP -iTCP:"$p" -sTCP:LISTEN 2>/dev/null | awk 'NR == 2 {print $1" (pid "$2")"}')"
+    # lsof exits 1 when the port is free; don't let pipefail treat that as an error.
+    holder="$( (lsof -nP -iTCP:"$p" -sTCP:LISTEN 2>/dev/null || true) | awk 'NR == 2 {print $1" (pid "$2")"}')"
     if [ -n "$holder" ]; then
       warn "local port $p is already in use by $holder (local Docker Desktop container or database?)"
       busy=1
