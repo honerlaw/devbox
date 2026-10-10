@@ -1,0 +1,697 @@
+#!/usr/bin/env bash
+# devbox: run your Docker containers on a DigitalOcean droplet instead of your
+# laptop. The docker CLI talks to the droplet over SSH (a Docker context), and
+# an SSH tunnel maps the containers' ports back to 127.0.0.1 locally.
+#
+# Written for the bash 3.2 that ships with macOS: no associative arrays, no
+# mapfile, no ${var,,}.
+set -euo pipefail
+
+DEVBOX_VERSION="0.1.0"
+
+resolve_root() {
+  local src="${BASH_SOURCE[0]}" dir
+  while [ -h "$src" ]; do
+    dir="$(cd -P "$(dirname "$src")" && pwd)"
+    src="$(readlink "$src")"
+    case "$src" in /*) ;; *) src="$dir/$src" ;; esac
+  done
+  cd -P "$(dirname "$src")/.." && pwd
+}
+
+DEVBOX_ROOT="$(resolve_root)"
+STATE_DIR="${DEVBOX_STATE_DIR:-$HOME/.config/devbox}"
+CONFIG_FILE="$STATE_DIR/config"
+SSH_CONFIG_FILE="$STATE_DIR/ssh_config"
+KNOWN_HOSTS_FILE="$STATE_DIR/known_hosts"
+TUNNEL_SOCK="$STATE_DIR/tunnel.sock"
+PREV_CONTEXT_FILE="$STATE_DIR/previous_docker_context"
+USER_SSH_CONFIG="$HOME/.ssh/config"
+INCLUDE_LINE="Include $SSH_CONFIG_FILE"
+ASSUME_YES=0
+
+DEFAULT_EXCLUDES=".git node_modules .env .env.* *.pem *.key id_rsa* id_ed25519* .DS_Store .next .turbo .venv venv __pycache__ target dist build coverage"
+
+# ---------------------------------------------------------------- helpers
+
+info() { printf '==> %s\n' "$*" >&2; }
+warn() { printf 'warning: %s\n' "$*" >&2; }
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+confirm() {
+  [ "$ASSUME_YES" = 1 ] && return 0
+  [ -t 0 ] || die "$1 (not a terminal; re-run with --yes to confirm)"
+  local reply
+  printf '%s [y/N] ' "$1" >&2
+  read -r reply
+  case "$reply" in y | Y | yes | YES) return 0 ;; *) die "aborted" ;; esac
+}
+
+need() {
+  local c
+  for c in "$@"; do
+    command -v "$c" >/dev/null 2>&1 || die "'$c' is required but not installed (see README: Requirements)"
+  done
+}
+
+dctl() {
+  if [ -n "${DEVBOX_DO_CONTEXT:-}" ]; then
+    doctl --context "$DEVBOX_DO_CONTEXT" "$@"
+  else
+    doctl "$@"
+  fi
+}
+
+matches() { [[ "$1" =~ $2 ]]; }
+
+load_config() {
+  DEVBOX_NAME="devbox"
+  DEVBOX_REGION="nyc3"
+  DEVBOX_SIZE="s-4vcpu-8gb"
+  DEVBOX_IMAGE="ubuntu-24-04-x64"
+  DEVBOX_USER="dev"
+  DEVBOX_SSH_KEY="$HOME/.ssh/devbox_ed25519"
+  DEVBOX_FORWARD_PORTS="5432 9200 11434"
+  DEVBOX_ALLOWED_CIDRS=""
+  DEVBOX_KEEP_SNAPSHOTS="1"
+  DEVBOX_SWITCH_CONTEXT="1"
+  DEVBOX_DO_CONTEXT=""
+
+  if [ -f "$CONFIG_FILE" ]; then
+    if [ -n "$(find "$CONFIG_FILE" -perm -022 2>/dev/null)" ]; then
+      die "$CONFIG_FILE is group/world-writable; run: chmod 600 $CONFIG_FILE"
+    fi
+    # shellcheck source=/dev/null
+    . "$CONFIG_FILE"
+  fi
+
+  matches "$DEVBOX_NAME" '^[a-z][a-z0-9-]{0,30}$' || die "DEVBOX_NAME must match [a-z][a-z0-9-]{0,30}"
+  matches "$DEVBOX_USER" '^[a-z_][a-z0-9_-]{0,31}$' || die "DEVBOX_USER is not a valid username"
+  matches "$DEVBOX_REGION" '^[a-z0-9-]+$' || die "DEVBOX_REGION is not a region slug"
+  matches "$DEVBOX_SIZE" '^[a-z0-9-]+$' || die "DEVBOX_SIZE is not a size slug"
+  matches "$DEVBOX_KEEP_SNAPSHOTS" '^[0-9]+$' || die "DEVBOX_KEEP_SNAPSHOTS must be a number"
+  matches "$HOME" '^/[A-Za-z0-9._/-]+$' || die "\$HOME ($HOME) contains characters devbox can't mirror safely"
+  local p
+  for p in $DEVBOX_FORWARD_PORTS; do
+    matches "$p" '^[0-9]{1,5}$' || die "bad port in DEVBOX_FORWARD_PORTS: $p"
+  done
+}
+
+# ---------------------------------------------------------------- DigitalOcean
+
+droplet_field() { # <jq expression applied to the droplet object>
+  local json count
+  json="$(dctl compute droplet list --tag-name "$DEVBOX_NAME" -o json)"
+  count="$(jq --arg n "$DEVBOX_NAME" '[(. // [])[] | select(.name == $n)] | length' <<<"$json")"
+  [ "$count" -le 1 ] || die "found $count droplets named '$DEVBOX_NAME' tagged '$DEVBOX_NAME'; resolve this manually"
+  jq -r --arg n "$DEVBOX_NAME" "(. // [])[] | select(.name == \$n) | $1" <<<"$json"
+}
+
+droplet_id() { droplet_field '.id'; }
+droplet_ip() { droplet_field '.networks.v4[] | select(.type == "public") | .ip_address'; }
+droplet_status() { droplet_field '.status'; }
+
+snapshot_list_json() { # sorted oldest -> newest, devbox snapshots only
+  dctl compute snapshot list --resource droplet -o json |
+    jq --arg re "^${DEVBOX_NAME}-[0-9]{8}-[0-9]{6}\$" '[(. // [])[] | select(.name | test($re))] | sort_by(.created_at)'
+}
+
+latest_snapshot() { # prints "<id> <region> <name>" or nothing
+  snapshot_list_json | jq -r 'last // empty | "\(.id) \(.regions[0]) \(.name)"'
+}
+
+public_ipv4() {
+  local ip url
+  for url in https://checkip.amazonaws.com https://api.ipify.org; do
+    ip="$(curl -fsS --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]')" || continue
+    if matches "$ip" '^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$' &&
+      [ "${BASH_REMATCH[1]}" -le 255 ] && [ "${BASH_REMATCH[2]}" -le 255 ] &&
+      [ "${BASH_REMATCH[3]}" -le 255 ] && [ "${BASH_REMATCH[4]}" -le 255 ]; then
+      printf '%s\n' "$ip"
+      return 0
+    fi
+  done
+  die "could not detect this machine's public IPv4; set DEVBOX_ALLOWED_CIDRS in $CONFIG_FILE"
+}
+
+allowed_cidrs() {
+  local cidrs="$DEVBOX_ALLOWED_CIDRS" c
+  [ -n "$cidrs" ] || cidrs="$(public_ipv4)/32"
+  for c in $cidrs; do
+    case "$c" in
+      0.0.0.0/0 | ::/0 | ::0/0) die "refusing to open SSH to the whole internet ($c)" ;;
+    esac
+    matches "$c" '^[0-9a-fA-F:.]+/[0-9]{1,3}$' || die "not a CIDR: $c"
+  done
+  printf '%s\n' "$cidrs"
+}
+
+ensure_tag() {
+  dctl compute tag get "$DEVBOX_NAME" >/dev/null 2>&1 || dctl compute tag create "$DEVBOX_NAME" >/dev/null
+}
+
+ensure_firewall() {
+  local cidrs inbound c fw_id
+  cidrs="$(allowed_cidrs)"
+  inbound="protocol:tcp,ports:22"
+  for c in $cidrs; do inbound="$inbound,address:$c"; done
+  local outbound="protocol:tcp,ports:all,address:0.0.0.0/0,address:::/0 protocol:udp,ports:all,address:0.0.0.0/0,address:::/0 protocol:icmp,address:0.0.0.0/0,address:::/0"
+
+  ensure_tag
+  fw_id="$(dctl compute firewall list -o json | jq -r --arg n "$DEVBOX_NAME" '(. // [])[] | select(.name == $n) | .id')"
+  if [ -z "$fw_id" ]; then
+    info "creating cloud firewall '$DEVBOX_NAME' (SSH from: $cidrs)"
+    dctl compute firewall create --name "$DEVBOX_NAME" --tag-names "$DEVBOX_NAME" \
+      --inbound-rules "$inbound" --outbound-rules "$outbound" >/dev/null
+  else
+    info "updating cloud firewall '$DEVBOX_NAME' (SSH from: $cidrs)"
+    dctl compute firewall update "$fw_id" --name "$DEVBOX_NAME" --tag-names "$DEVBOX_NAME" \
+      --inbound-rules "$inbound" --outbound-rules "$outbound" >/dev/null
+  fi
+}
+
+ssh_pubkey() { # "type base64" with the comment stripped, validated
+  local pub
+  pub="$(awk '{print $1" "$2}' "$DEVBOX_SSH_KEY.pub")"
+  matches "$pub" '^(ssh-ed25519|ecdsa-sha2-nistp(256|384|521)|ssh-rsa) [A-Za-z0-9+/=]+$' ||
+    die "$DEVBOX_SSH_KEY.pub does not look like an OpenSSH public key"
+  printf '%s\n' "$pub"
+}
+
+ensure_do_ssh_key() { # prints the key's MD5 fingerprint as DigitalOcean shows it
+  local fp
+  [ -f "$DEVBOX_SSH_KEY.pub" ] || die "missing $DEVBOX_SSH_KEY.pub; run: devbox init"
+  fp="$(ssh-keygen -l -E md5 -f "$DEVBOX_SSH_KEY.pub" | awk '{print $2}' | sed 's/^MD5://')"
+  if [ -z "$(dctl compute ssh-key list -o json | jq -r --arg fp "$fp" '(. // [])[] | select(.fingerprint == $fp) | .id')" ]; then
+    info "uploading public key to DigitalOcean as '$DEVBOX_NAME-$(hostname -s)'"
+    dctl compute ssh-key import "$DEVBOX_NAME-$(hostname -s)" --public-key-file "$DEVBOX_SSH_KEY.pub" >/dev/null
+  fi
+  printf '%s\n' "$fp"
+}
+
+render_cloud_init() { # <output file>
+  awk -v user="$DEVBOX_USER" -v key="$(ssh_pubkey)" -v root="$HOME" '
+    { gsub(/__DEVBOX_USER__/, user); gsub(/__SSH_PUBKEY__/, key); gsub(/__MIRROR_ROOT__/, root); print }
+  ' "$DEVBOX_ROOT/lib/cloud-init.yaml" >"$1"
+}
+
+# ---------------------------------------------------------------- local SSH / Docker
+
+write_ssh_config() { # <ip>
+  (umask 077 && : >"$SSH_CONFIG_FILE")
+  cat >"$SSH_CONFIG_FILE" <<EOF
+# Managed by devbox; rewritten on every \`devbox up\`.
+Host $DEVBOX_NAME
+  HostName ${1:-0.0.0.0}
+  User $DEVBOX_USER
+  IdentityFile $DEVBOX_SSH_KEY
+  IdentitiesOnly yes
+  IgnoreUnknown UseKeychain
+  UseKeychain yes
+  AddKeysToAgent yes
+  HostKeyAlias $DEVBOX_NAME
+  UserKnownHostsFile $KNOWN_HOSTS_FILE
+  StrictHostKeyChecking accept-new
+  ControlMaster auto
+  ControlPath $STATE_DIR/cm-%C
+  ControlPersist 10m
+  ServerAliveInterval 30
+  ServerAliveCountMax 3
+  ForwardAgent no
+  ForwardX11 no
+
+# Close the Host block so lines after the Include in ~/.ssh/config stay global.
+Host *
+EOF
+}
+
+ensure_ssh_include() {
+  mkdir -p "$HOME/.ssh"
+  chmod 700 "$HOME/.ssh"
+  if [ -f "$USER_SSH_CONFIG" ] && grep -qxF "$INCLUDE_LINE" "$USER_SSH_CONFIG"; then
+    return 0
+  fi
+  info "adding '$INCLUDE_LINE' to the top of $USER_SSH_CONFIG"
+  local tmp
+  tmp="$(mktemp "$HOME/.ssh/config.devbox.XXXXXX")"
+  {
+    printf '%s\n\n' "$INCLUDE_LINE"
+    if [ -f "$USER_SSH_CONFIG" ]; then
+      cp -p "$USER_SSH_CONFIG" "$USER_SSH_CONFIG.devbox-backup"
+      cat "$USER_SSH_CONFIG"
+    fi
+  } >"$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$USER_SSH_CONFIG"
+}
+
+remove_ssh_include() {
+  [ -f "$USER_SSH_CONFIG" ] || return 0
+  grep -qxF "$INCLUDE_LINE" "$USER_SSH_CONFIG" || return 0
+  local tmp
+  tmp="$(mktemp "$HOME/.ssh/config.devbox.XXXXXX")"
+  # Drop the Include line and the blank line devbox added after it.
+  awk -v inc="$INCLUDE_LINE" 'skip && $0 == "" { skip = 0; next } { skip = 0 } $0 == inc { skip = 1; next } { print }' \
+    "$USER_SSH_CONFIG" >"$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$USER_SSH_CONFIG"
+}
+
+forget_host_key() {
+  [ -f "$KNOWN_HOSTS_FILE" ] || return 0
+  ssh-keygen -R "$DEVBOX_NAME" -f "$KNOWN_HOSTS_FILE" >/dev/null 2>&1 || true
+  rm -f "$KNOWN_HOSTS_FILE.old"
+}
+
+close_ssh_master() { ssh -O exit "$DEVBOX_NAME" >/dev/null 2>&1 || true; }
+
+wait_ready() {
+  info "waiting for the droplet to finish provisioning (first boot takes 2-5 minutes)"
+  local _
+  for _ in $(seq 1 90); do
+    # No connection sharing while waiting: a master opened before the user
+    # joined the docker group would keep the old group list for 10 minutes.
+    if ssh -o BatchMode=yes -o ConnectTimeout=5 -o ControlMaster=no -o ControlPath=none "$DEVBOX_NAME" \
+      'cmp -s /var/lib/cloud/data/instance-id /var/lib/devbox/provisioned && docker info >/dev/null 2>&1' 2>/dev/null; then
+      return 0
+    fi
+    sleep 5
+  done
+  die "droplet not ready after ~10 minutes; inspect with: devbox ssh 'sudo cloud-init status --long; sudo tail -50 /var/log/cloud-init-output.log'"
+}
+
+ensure_docker_context() {
+  if ! docker context inspect "$DEVBOX_NAME" >/dev/null 2>&1; then
+    info "creating Docker context '$DEVBOX_NAME'"
+    docker context create "$DEVBOX_NAME" --description "devbox on DigitalOcean (ssh://$DEVBOX_NAME)" \
+      --docker "host=ssh://$DEVBOX_NAME" >/dev/null
+  fi
+}
+
+use_devbox_context() {
+  [ "$DEVBOX_SWITCH_CONTEXT" = 1 ] || return 0
+  local current
+  current="$(docker context show 2>/dev/null || true)"
+  if [ -n "$current" ] && [ "$current" != "$DEVBOX_NAME" ]; then
+    printf '%s\n' "$current" >"$PREV_CONTEXT_FILE"
+  fi
+  docker context use "$DEVBOX_NAME" >/dev/null
+  info "docker now targets the devbox (docker context: $DEVBOX_NAME)"
+  if [ -n "${DOCKER_HOST:-}" ] || [ -n "${DOCKER_CONTEXT:-}" ]; then
+    warn "DOCKER_HOST/DOCKER_CONTEXT is set in this shell and overrides the active context"
+  fi
+}
+
+restore_previous_context() {
+  [ "$DEVBOX_SWITCH_CONTEXT" = 1 ] || return 0
+  [ "$(docker context show 2>/dev/null || true)" = "$DEVBOX_NAME" ] || return 0
+  local prev="default"
+  [ -f "$PREV_CONTEXT_FILE" ] && prev="$(cat "$PREV_CONTEXT_FILE")"
+  docker context inspect "$prev" >/dev/null 2>&1 || prev="default"
+  docker context use "$prev" >/dev/null
+  info "docker context switched back to '$prev'"
+}
+
+tunnel_running() { ssh -S "$TUNNEL_SOCK" -O check "$DEVBOX_NAME" >/dev/null 2>&1; }
+
+tunnel_start() {
+  if tunnel_running; then
+    info "tunnel already running (ports: $DEVBOX_FORWARD_PORTS)"
+    return 0
+  fi
+  rm -f "$TUNNEL_SOCK"
+  local args="" p holder busy=0
+  for p in $DEVBOX_FORWARD_PORTS; do
+    holder="$(lsof -nP -iTCP:"$p" -sTCP:LISTEN 2>/dev/null | awk 'NR == 2 {print $1" (pid "$2")"}')"
+    if [ -n "$holder" ]; then
+      warn "local port $p is already in use by $holder (local Docker Desktop container or database?)"
+      busy=1
+    fi
+    args="$args -L 127.0.0.1:$p:127.0.0.1:$p"
+  done
+  [ "$busy" = 0 ] || die "free the ports above (e.g. stop local containers) or change DEVBOX_FORWARD_PORTS, then: devbox tunnel start"
+  # shellcheck disable=SC2086 # $args is a list of -L flags
+  ssh -f -N -M -S "$TUNNEL_SOCK" -o ControlPersist=no -o ExitOnForwardFailure=yes \
+    -o ServerAliveInterval=15 -o ServerAliveCountMax=3 $args "$DEVBOX_NAME"
+  info "tunnel up: 127.0.0.1:{$(echo "$DEVBOX_FORWARD_PORTS" | tr ' ' ',')} -> devbox"
+}
+
+tunnel_stop() {
+  if tunnel_running; then
+    ssh -S "$TUNNEL_SOCK" -O exit "$DEVBOX_NAME" >/dev/null 2>&1 || true
+    info "tunnel stopped"
+  fi
+  rm -f "$TUNNEL_SOCK"
+}
+
+# ---------------------------------------------------------------- commands
+
+cmd_init() {
+  need doctl docker jq ssh ssh-keygen rsync curl
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --region) DEVBOX_INIT_REGION="${2:?--region needs a value}"; shift 2 ;;
+      --size) DEVBOX_INIT_SIZE="${2:?--size needs a value}"; shift 2 ;;
+      -y | --yes) shift ;;
+      *) die "unknown option for init: $1" ;;
+    esac
+  done
+
+  mkdir -p "$STATE_DIR"
+  chmod 700 "$STATE_DIR"
+  if [ ! -f "$CONFIG_FILE" ]; then
+    (umask 077 && cp "$DEVBOX_ROOT/config.example" "$CONFIG_FILE")
+    info "wrote $CONFIG_FILE"
+  fi
+  if [ -n "${DEVBOX_INIT_REGION:-}" ]; then
+    matches "$DEVBOX_INIT_REGION" '^[a-z0-9-]+$' || die "bad region slug: $DEVBOX_INIT_REGION"
+    sed -i.bak "s|^DEVBOX_REGION=.*|DEVBOX_REGION=\"$DEVBOX_INIT_REGION\"|" "$CONFIG_FILE" && rm -f "$CONFIG_FILE.bak"
+  fi
+  if [ -n "${DEVBOX_INIT_SIZE:-}" ]; then
+    matches "$DEVBOX_INIT_SIZE" '^[a-z0-9-]+$' || die "bad size slug: $DEVBOX_INIT_SIZE"
+    sed -i.bak "s|^DEVBOX_SIZE=.*|DEVBOX_SIZE=\"$DEVBOX_INIT_SIZE\"|" "$CONFIG_FILE" && rm -f "$CONFIG_FILE.bak"
+  fi
+  chmod 600 "$CONFIG_FILE"
+  load_config
+
+  dctl account get >/dev/null 2>&1 || die "doctl is not authenticated; run: doctl auth init"
+  dctl compute region list -o json | jq -e --arg r "$DEVBOX_REGION" '.[] | select(.slug == $r and .available)' >/dev/null ||
+    die "region '$DEVBOX_REGION' is not available (doctl compute region list)"
+  dctl compute size list -o json | jq -e --arg s "$DEVBOX_SIZE" '.[] | select(.slug == $s)' >/dev/null ||
+    die "size '$DEVBOX_SIZE' does not exist (doctl compute size list)"
+
+  if [ ! -f "$DEVBOX_SSH_KEY" ]; then
+    info "generating SSH key $DEVBOX_SSH_KEY"
+    ssh-keygen -q -t ed25519 -N "" -C "devbox@$(hostname -s)" -f "$DEVBOX_SSH_KEY"
+  fi
+  ensure_do_ssh_key >/dev/null
+  [ -f "$SSH_CONFIG_FILE" ] || write_ssh_config ""
+  ensure_ssh_include
+
+  info "initialized: region=$DEVBOX_REGION size=$DEVBOX_SIZE. Next: devbox up"
+}
+
+cmd_up() {
+  need doctl docker jq ssh curl
+  [ -f "$CONFIG_FILE" ] || die "not initialized; run: devbox init"
+  [ -f "$DEVBOX_SSH_KEY" ] || die "missing $DEVBOX_SSH_KEY; run: devbox init"
+  ensure_ssh_include
+
+  local fp id status ip created=0
+  fp="$(ensure_do_ssh_key)"
+  ensure_firewall
+
+  id="$(droplet_id)"
+  if [ -n "$id" ]; then
+    status="$(droplet_status)"
+    if [ "$status" = "off" ]; then
+      info "powering on droplet $DEVBOX_NAME"
+      dctl compute droplet-action power-on "$id" --wait >/dev/null
+    fi
+  else
+    local image="$DEVBOX_IMAGE" snap snap_id snap_region snap_name
+    snap="$(latest_snapshot)"
+    if [ -n "$snap" ]; then
+      read -r snap_id snap_region snap_name <<<"$snap"
+      [ "$snap_region" = "$DEVBOX_REGION" ] ||
+        die "latest snapshot $snap_name is in $snap_region but DEVBOX_REGION=$DEVBOX_REGION; transfer it or change the region"
+      image="$snap_id"
+      info "restoring droplet from snapshot $snap_name"
+    else
+      info "creating droplet $DEVBOX_NAME ($DEVBOX_SIZE in $DEVBOX_REGION, $DEVBOX_IMAGE)"
+    fi
+    local user_data
+    user_data="$(mktemp "${TMPDIR:-/tmp}/devbox-user-data.XXXXXX")"
+    # shellcheck disable=SC2064 # expand now: the variable is local
+    trap "rm -f '$user_data'" EXIT
+    render_cloud_init "$user_data"
+    dctl compute droplet create "$DEVBOX_NAME" \
+      --region "$DEVBOX_REGION" --size "$DEVBOX_SIZE" --image "$image" \
+      --ssh-keys "$fp" --tag-names "$DEVBOX_NAME" --user-data-file "$user_data" \
+      --enable-monitoring --droplet-agent=false --wait >/dev/null
+    rm -f "$user_data"
+    created=1
+  fi
+
+  ip="$(droplet_ip)"
+  [ -n "$ip" ] || die "droplet has no public IPv4 yet; re-run devbox up"
+  write_ssh_config "$ip"
+  if [ "$created" = 1 ]; then
+    # New droplet, new host keys: trust-on-first-use against the fresh machine.
+    forget_host_key
+    close_ssh_master
+  fi
+  wait_ready
+  close_ssh_master
+
+  ensure_docker_context
+  use_devbox_context
+  tunnel_start
+  info "devbox is up at $ip. Try: docker ps   (or: devbox status)"
+}
+
+cmd_down() {
+  need doctl jq
+  local id snap_name
+  tunnel_stop
+  close_ssh_master
+  restore_previous_context
+  id="$(droplet_id)"
+  if [ -z "$id" ]; then
+    info "no droplet named $DEVBOX_NAME; nothing to do"
+    return 0
+  fi
+  snap_name="$DEVBOX_NAME-$(date -u +%Y%m%d-%H%M%S)"
+  info "shutting down droplet"
+  dctl compute droplet-action shutdown "$id" --wait >/dev/null 2>&1 ||
+    dctl compute droplet-action power-off "$id" --wait >/dev/null
+  info "snapshotting to $snap_name (this can take several minutes)"
+  dctl compute droplet-action snapshot "$id" --snapshot-name "$snap_name" --wait >/dev/null
+  snapshot_list_json | jq -e --arg n "$snap_name" '.[] | select(.name == $n)' >/dev/null ||
+    die "snapshot $snap_name not found after snapshotting; droplet left in place (powered off, still billed)"
+  info "deleting droplet (snapshot $snap_name holds its disk)"
+  dctl compute droplet delete "$id" --force >/dev/null
+  prune_snapshots
+  info "devbox is down. Snapshot storage is billed per GB; the droplet no longer is."
+}
+
+prune_snapshots() {
+  local ids
+  ids="$(snapshot_list_json | jq -r --argjson keep "$DEVBOX_KEEP_SNAPSHOTS" 'if length > $keep then .[0:(length - $keep)][] | .id else empty end')"
+  local s
+  for s in $ids; do
+    info "deleting old snapshot $s"
+    dctl compute snapshot delete "$s" --force >/dev/null
+  done
+}
+
+cmd_destroy() {
+  need doctl jq
+  local purge=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --purge) purge=1; shift ;;
+      -y | --yes) ASSUME_YES=1; shift ;;
+      *) die "unknown option for destroy: $1" ;;
+    esac
+  done
+  local id
+  id="$(droplet_id)"
+  if [ "$purge" = 1 ]; then
+    confirm "Permanently delete droplet '$DEVBOX_NAME' WITHOUT a snapshot, all '$DEVBOX_NAME-*' snapshots, and the '$DEVBOX_NAME' firewall?"
+  else
+    confirm "Permanently delete droplet '$DEVBOX_NAME' and all container data on it WITHOUT a snapshot?"
+  fi
+  tunnel_stop
+  close_ssh_master
+  restore_previous_context
+  if [ -n "$id" ]; then
+    dctl compute droplet delete "$id" --force >/dev/null
+    info "deleted droplet $DEVBOX_NAME"
+  fi
+  forget_host_key
+  if [ "$purge" = 1 ]; then
+    local s fw_id
+    for s in $(snapshot_list_json | jq -r '.[].id'); do
+      dctl compute snapshot delete "$s" --force >/dev/null
+      info "deleted snapshot $s"
+    done
+    fw_id="$(dctl compute firewall list -o json | jq -r --arg n "$DEVBOX_NAME" '(. // [])[] | select(.name == $n) | .id')"
+    if [ -n "$fw_id" ]; then
+      dctl compute firewall delete "$fw_id" --force >/dev/null
+      info "deleted firewall $DEVBOX_NAME"
+    fi
+  fi
+}
+
+cmd_status() {
+  need doctl jq
+  local json
+  json="$(dctl compute droplet list --tag-name "$DEVBOX_NAME" -o json |
+    jq --arg n "$DEVBOX_NAME" '[(. // [])[] | select(.name == $n)] | first // empty')"
+  if [ -n "$json" ]; then
+    jq -r '"droplet:   \(.name) [\(.status)] \(.networks.v4[] | select(.type == "public") | .ip_address)\nsize:      \(.size_slug) in \(.region.slug) ($\(.size.price_monthly)/mo while it exists, even powered off)"' <<<"$json"
+  else
+    echo "droplet:   none"
+  fi
+  local snaps
+  snaps="$(snapshot_list_json | jq -r '.[] | "           \(.name)  \(.size_gigabytes) GB  \(.regions[0])"')"
+  if [ -n "$snaps" ]; then printf 'snapshots:\n%s\n' "$snaps"; else echo "snapshots: none"; fi
+  local fw
+  fw="$(dctl compute firewall list -o json | jq -r --arg n "$DEVBOX_NAME" \
+    '(. // [])[] | select(.name == $n) | [.inbound_rules[] | select(.ports == "22") | .sources.addresses[]] | join(" ")')"
+  if [ -n "$fw" ]; then echo "firewall:  SSH allowed from $fw"; else echo "firewall:  none"; fi
+  if tunnel_running; then echo "tunnel:    up (127.0.0.1: $DEVBOX_FORWARD_PORTS)"; else echo "tunnel:    down"; fi
+  echo "docker:    active context '$(docker context show 2>/dev/null || echo '?')'"
+}
+
+cmd_tunnel() {
+  case "${1:-status}" in
+    start) tunnel_start ;;
+    stop) tunnel_stop ;;
+    restart) tunnel_stop; tunnel_start ;;
+    status) if tunnel_running; then echo "up (127.0.0.1: $DEVBOX_FORWARD_PORTS)"; else echo "down"; fi ;;
+    *) die "usage: devbox tunnel [start|stop|restart|status]" ;;
+  esac
+}
+
+cmd_sync() {
+  need rsync ssh
+  local dir="${1:-$PWD}"
+  [ -d "$dir" ] || die "not a directory: $dir"
+  dir="$(cd "$dir" && pwd)"
+  case "$dir" in
+    "$HOME"/*) ;;
+    *) die "only directories under $HOME are mirrored (got $dir)" ;;
+  esac
+  matches "$dir" '^/[A-Za-z0-9._/-]+$' || die "path has characters devbox won't pass to a remote shell: $dir"
+
+  local exclude_args=() e
+  set -f # keep patterns like *.pem from globbing against the cwd
+  for e in $DEFAULT_EXCLUDES; do exclude_args+=(--exclude "$e"); done
+  set +f
+  if [ -f "$dir/.devboxignore" ]; then exclude_args+=(--exclude-from "$dir/.devboxignore"); fi
+
+  info "syncing $dir -> $DEVBOX_NAME:$dir"
+  # shellcheck disable=SC2029 # intentional: $dir is validated above
+  ssh "$DEVBOX_NAME" "mkdir -p '$dir'"
+  rsync -az --delete "${exclude_args[@]}" "$dir/" "$DEVBOX_NAME:$dir/"
+}
+
+cmd_compose() {
+  need docker
+  [ "${DEVBOX_NO_SYNC:-0}" = 1 ] || cmd_sync "$PWD"
+  exec docker --context "$DEVBOX_NAME" compose "$@"
+}
+
+cmd_allow_ip() {
+  need doctl jq curl
+  ensure_firewall
+}
+
+cmd_doctor() {
+  local ok=1 c
+  for c in doctl docker jq ssh ssh-keygen rsync curl lsof; do
+    if command -v "$c" >/dev/null 2>&1; then echo "ok    $c"; else echo "FAIL  $c not installed"; ok=0; fi
+  done
+  if [ -f "$CONFIG_FILE" ]; then echo "ok    config $CONFIG_FILE"; else echo "FAIL  no config; run: devbox init"; ok=0; fi
+  if [ -f "$DEVBOX_SSH_KEY" ]; then echo "ok    ssh key $DEVBOX_SSH_KEY"; else echo "FAIL  no ssh key; run: devbox init"; ok=0; fi
+  if [ -f "$USER_SSH_CONFIG" ] && grep -qxF "$INCLUDE_LINE" "$USER_SSH_CONFIG"; then
+    echo "ok    ~/.ssh/config includes devbox"
+  else
+    echo "FAIL  ~/.ssh/config missing '$INCLUDE_LINE'; run: devbox init"; ok=0
+  fi
+  if command -v doctl >/dev/null 2>&1 && dctl account get >/dev/null 2>&1; then
+    echo "ok    doctl authenticated"
+  else
+    echo "FAIL  doctl not authenticated; run: doctl auth init"; ok=0
+  fi
+  if command -v docker >/dev/null 2>&1 && docker context inspect "$DEVBOX_NAME" >/dev/null 2>&1; then
+    echo "ok    docker context '$DEVBOX_NAME'"
+  else
+    echo "info  docker context '$DEVBOX_NAME' not created yet (devbox up creates it)"
+  fi
+  [ "$ok" = 1 ] || exit 1
+}
+
+cmd_uninstall() {
+  case "${1:-}" in -y | --yes) ASSUME_YES=1 ;; esac
+  confirm "Remove devbox's local setup (docker context, ~/.ssh/config Include, $STATE_DIR)? Cloud resources are NOT touched."
+  tunnel_stop
+  close_ssh_master
+  restore_previous_context
+  docker context rm -f "$DEVBOX_NAME" >/dev/null 2>&1 || true
+  remove_ssh_include
+  rm -rf "$STATE_DIR"
+  local link="$HOME/.local/bin/devbox"
+  if [ -h "$link" ] && [ "$(readlink "$link")" = "$DEVBOX_ROOT/bin/devbox" ]; then rm -f "$link"; fi
+  info "local setup removed. Kept: $DEVBOX_SSH_KEY (delete it yourself if unused)."
+  if command -v doctl >/dev/null 2>&1 && [ -n "$(droplet_id 2>/dev/null || true)" ]; then
+    warn "droplet '$DEVBOX_NAME' still exists and is billed; delete it in the DigitalOcean console or reinstall and run devbox destroy"
+  fi
+}
+
+usage() {
+  cat <<EOF
+devbox $DEVBOX_VERSION: run Docker on a DigitalOcean droplet from this machine.
+
+Usage: devbox [--yes] <command> [args]
+
+Setup
+  init [--region R] [--size S]  create config, SSH key, ~/.ssh/config Include
+  doctor                        check local prerequisites
+  uninstall                     remove local setup (cloud resources untouched)
+
+Lifecycle
+  up                            create/restore/start the droplet, firewall, context, tunnel
+  down                          snapshot the droplet, then delete it (stops droplet billing)
+  destroy [--purge]             delete the droplet WITHOUT a snapshot (--purge: snapshots + firewall too)
+  status                        droplet, snapshots, firewall, tunnel, docker context
+
+Daily use
+  tunnel [start|stop|restart|status]  forward DEVBOX_FORWARD_PORTS to 127.0.0.1
+  sync [dir]                    mirror dir (default: cwd) to the same path on the droplet
+  compose <args>                sync cwd, then docker compose against the devbox
+  ssh [cmd]                     shell on the droplet
+  allow-ip                      point the firewall at this machine's current public IP
+
+Config: $CONFIG_FILE
+EOF
+}
+
+main() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -y | --yes) ASSUME_YES=1; shift ;;
+      -h | --help | help) usage; exit 0 ;;
+      --version | version) echo "$DEVBOX_VERSION"; exit 0 ;;
+      *) break ;;
+    esac
+  done
+  local cmd="${1:-}"
+  [ -n "$cmd" ] || { usage; exit 1; }
+  shift
+
+  if [ "$cmd" = init ]; then
+    cmd_init "$@"
+    return
+  fi
+  load_config
+  case "$cmd" in
+    up) cmd_up "$@" ;;
+    down) cmd_down "$@" ;;
+    destroy) cmd_destroy "$@" ;;
+    status) cmd_status "$@" ;;
+    tunnel) cmd_tunnel "$@" ;;
+    sync) cmd_sync "$@" ;;
+    compose) cmd_compose "$@" ;;
+    ssh) exec ssh "$DEVBOX_NAME" "$@" ;;
+    allow-ip) cmd_allow_ip "$@" ;;
+    doctor) cmd_doctor "$@" ;;
+    uninstall) cmd_uninstall "$@" ;;
+    *) usage; die "unknown command: $cmd" ;;
+  esac
+}
+
+# Sourceable for testing: only run when executed directly.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then main "$@"; fi

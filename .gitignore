@@ -1,0 +1,12 @@
+# Local state lives in ~/.config/devbox, never in the repo. Guard against
+# copies of it landing here anyway.
+config
+ssh_config
+known_hosts
+*.sock
+.env
+.env.*
+*.pem
+*_ed25519
+*_ed25519.pub
+.DS_Store

@@ -1,0 +1,139 @@
+#cloud-config
+# Rendered by `devbox up` and passed to the droplet as user-data.
+# Double-underscore placeholders below are replaced at render time.
+# Nothing secret belongs in this file: user-data is readable from the droplet's
+# metadata service.
+
+package_update: true
+package_upgrade: true
+packages:
+  - ca-certificates
+  - curl
+  - gnupg
+  - rsync
+
+disable_root: true
+ssh_pwauth: false
+
+users:
+  - name: __DEVBOX_USER__
+    shell: /bin/bash
+    groups: [sudo]
+    sudo: "ALL=(ALL) NOPASSWD:ALL"
+    lock_passwd: true
+    ssh_authorized_keys:
+      - "__SSH_PUBKEY__"
+
+write_files:
+  # Key-only SSH for one user. Local (-L) forwarding stays on because the port
+  # tunnel needs it; everything else is off. 00- sorts before cloud-init's own
+  # drop-in, and sshd keeps the first value it reads.
+  - path: /etc/ssh/sshd_config.d/00-devbox.conf
+    permissions: "0644"
+    content: |
+      PermitRootLogin no
+      PasswordAuthentication no
+      KbdInteractiveAuthentication no
+      AuthenticationMethods publickey
+      AllowUsers __DEVBOX_USER__
+      AllowTcpForwarding local
+      AllowAgentForwarding no
+      AllowStreamLocalForwarding no
+      X11Forwarding no
+      PermitTunnel no
+      MaxAuthTries 3
+      LoginGraceTime 20
+
+  # "ip": published ports with no explicit host IP bind to loopback, so
+  # `ports: ["5432:5432"]` is reachable only through the SSH tunnel.
+  - path: /etc/docker/daemon.json
+    permissions: "0644"
+    content: |
+      {
+        "ip": "127.0.0.1",
+        "log-driver": "local",
+        "log-opts": { "max-size": "10m", "max-file": "3" },
+        "live-restore": true
+      }
+
+  # OpenSearch / Elasticsearch need this; Docker Desktop's VM sets it for you.
+  - path: /etc/sysctl.d/99-devbox.conf
+    permissions: "0644"
+    content: |
+      vm.max_map_count=262144
+
+  # Third layer behind the cloud firewall and the loopback default: drop new
+  # inbound connections from the public/VPC interfaces to any container, even
+  # one published explicitly on 0.0.0.0.
+  - path: /usr/local/sbin/devbox-docker-guard
+    permissions: "0755"
+    content: |
+      #!/bin/sh
+      set -eu
+      for ipt in iptables ip6tables; do
+        command -v "$ipt" >/dev/null 2>&1 || continue
+        "$ipt" -n -L DOCKER-USER >/dev/null 2>&1 || continue
+        for ifc in eth0 eth1; do
+          "$ipt" -C DOCKER-USER -i "$ifc" -m conntrack --ctstate NEW -j DROP 2>/dev/null \
+            || "$ipt" -I DOCKER-USER -i "$ifc" -m conntrack --ctstate NEW -j DROP
+        done
+      done
+  - path: /etc/systemd/system/devbox-docker-guard.service
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Block inbound connections to Docker containers from external interfaces
+      After=docker.service
+      PartOf=docker.service
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/sbin/devbox-docker-guard
+      RemainAfterExit=yes
+
+      [Install]
+      WantedBy=docker.service
+
+  # Idempotent: also re-runs when a droplet is restored from a snapshot.
+  - path: /usr/local/sbin/devbox-provision
+    permissions: "0755"
+    content: |
+      #!/bin/sh
+      set -eu
+      export DEBIAN_FRONTEND=noninteractive
+
+      if ! command -v docker >/dev/null 2>&1; then
+        install -m 0755 -d /etc/apt/keyrings
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+        # Pin Docker's published release-signing key before trusting the repo.
+        gpg --show-keys --with-colons /etc/apt/keyrings/docker.asc \
+          | grep -q '^fpr:::::::::9DC858229FC7DD38854AE2D88D81803C0EBFCD88:$'
+        chmod a+r /etc/apt/keyrings/docker.asc
+        . /etc/os-release
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu ${VERSION_CODENAME} stable" \
+          > /etc/apt/sources.list.d/docker.list
+        apt-get update
+        apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+      fi
+
+      usermod -aG docker __DEVBOX_USER__
+      # Mirror the laptop's $HOME so compose bind mounts resolve to the same path.
+      mkdir -p __MIRROR_ROOT__
+      chown __DEVBOX_USER__:__DEVBOX_USER__ __MIRROR_ROOT__
+
+      sysctl --system >/dev/null
+      systemctl daemon-reload
+      systemctl enable docker devbox-docker-guard.service
+      systemctl restart docker
+      systemctl restart devbox-docker-guard.service
+
+      sshd -t
+      systemctl restart ssh
+
+      # Keyed to the instance id so a snapshot-restored droplet's stale marker
+      # doesn't count as "ready" before this boot's provisioning finishes.
+      mkdir -p /var/lib/devbox
+      cp /var/lib/cloud/data/instance-id /var/lib/devbox/provisioned
+
+runcmd:
+  - [/usr/local/sbin/devbox-provision]

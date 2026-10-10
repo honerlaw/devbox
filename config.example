@@ -1,0 +1,37 @@
+# devbox configuration. `devbox init` copies this to ~/.config/devbox/config.
+# It is sourced as shell, so keep it to plain KEY="value" lines and keep the
+# file private (devbox refuses to read it if it is group- or world-writable).
+
+# Name of the droplet. Also used for its tag, cloud firewall, SSH host alias,
+# Docker context, and snapshot names. devbox only touches resources with this
+# exact name/tag.
+DEVBOX_NAME="devbox"
+
+# `doctl compute region list` / `doctl compute size list`
+DEVBOX_REGION="nyc3"
+DEVBOX_SIZE="s-4vcpu-8gb"
+DEVBOX_IMAGE="ubuntu-24-04-x64"
+
+# Login user created on the droplet (root login is disabled).
+DEVBOX_USER="dev"
+
+# Dedicated key for the droplet; created by `devbox init` if it does not exist.
+DEVBOX_SSH_KEY="$HOME/.ssh/devbox_ed25519"
+
+# Remote ports forwarded to 127.0.0.1 on this machine by `devbox tunnel`.
+DEVBOX_FORWARD_PORTS="5432 9200 11434"
+
+# Space-separated CIDRs allowed to reach SSH. Empty means "this machine's
+# current public IPv4 /32", refreshed on every `devbox up` / `devbox allow-ip`.
+# 0.0.0.0/0 and ::/0 are refused.
+DEVBOX_ALLOWED_CIDRS=""
+
+# Snapshots kept by `devbox down` (older ones are deleted).
+DEVBOX_KEEP_SNAPSHOTS="1"
+
+# 1 = `devbox up` makes the devbox the active Docker context and `devbox down`
+# switches back to the previous one.
+DEVBOX_SWITCH_CONTEXT="1"
+
+# doctl auth context to use (`doctl auth list`). Empty means doctl's current one.
+DEVBOX_DO_CONTEXT=""
